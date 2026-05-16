@@ -62,6 +62,18 @@ def detect_art_box(im: Image.Image) -> tuple[int, int, int, int]:
     return FULL_BORDERLESS_ART_BOX
 
 
+def crop_card_art(im: Image.Image) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    """Detect layout and return cropped art (same logic as the clean pipeline)."""
+    rgb = im.convert("RGB")
+    box = detect_art_box(rgb)
+    return rgb.crop(box), box
+
+
+def is_full_card_image(im: Image.Image) -> bool:
+    """True when the image is large enough to be an uncropped TCG card scan."""
+    return im.width >= 700 and im.height >= 900
+
+
 def clean_name(path: Path) -> str:
     """me2-1_large.png -> me2-1.png"""
     stem = path.stem
@@ -143,9 +155,9 @@ def main() -> int:
 
             try:
                 with Image.open(src) as im:
-                    rgb = im.convert("RGB")
-                    art_box = detect_art_box(rgb)
-                    crop_card(rgb, dest, art_box)
+                    cropped, art_box = crop_card_art(im)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    cropped.save(dest)
                 print(f"{src.relative_to(in_root)} {art_box} -> {dest.name}")
                 ok += 1
             except OSError as e:
