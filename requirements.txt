@@ -1,0 +1,5 @@
+torch>=2.0
+torchvision>=0.15
+open-clip-torch>=2.24
+chromadb>=0.5
+pillow>=10.0
