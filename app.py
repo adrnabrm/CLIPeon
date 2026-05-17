@@ -86,21 +86,23 @@ def search(query_image: Image.Image | None, k: int) -> list[tuple[Image.Image, s
         results["distances"][0],
     ):
         score = 1.0 - dist
+        if score >= 0.9999:
+            continue
         set_id = meta["set_id"]
         caption = f"{card_id}  ·  {set_id}  ·  {score:.4f}"
 
-        clean_rel = meta.get("path")
         img: Image.Image | None = None
 
-        if clean_rel:
-            clean_abs = PROJECT_ROOT / clean_rel
-            if clean_abs.is_file():
-                img = Image.open(clean_abs).convert("RGB")
+        raw_path = find_raw_image(card_id, set_id, _raw_root)
+        if raw_path and raw_path.is_file():
+            img = Image.open(raw_path).convert("RGB")
 
         if img is None:
-            raw_path = find_raw_image(card_id, set_id, _raw_root)
-            if raw_path and raw_path.is_file():
-                img = Image.open(raw_path).convert("RGB")
+            clean_rel = meta.get("path")
+            if clean_rel:
+                clean_abs = PROJECT_ROOT / clean_rel
+                if clean_abs.is_file():
+                    img = Image.open(clean_abs).convert("RGB")
 
         if img is not None:
             gallery.append((img, caption))
