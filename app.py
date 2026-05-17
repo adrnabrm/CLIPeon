@@ -229,7 +229,7 @@ def build_ui() -> gr.Blocks:
                 )
                 k_slider = gr.Slider(
                     minimum=1,
-                    maximum=20,
+                    maximum=12,
                     step=1,
                     value=5,
                     label="Top k results",
