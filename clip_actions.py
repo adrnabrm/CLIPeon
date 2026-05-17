@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,7 +41,7 @@ DEFAULT_COLLECTION = "cards"
 EMBED_BATCH_SIZE = 32
 DEFAULT_COLOR_BINS = 32
 DEFAULT_CLIP_WEIGHT = 0.65
-DEFAULT_COLOR_WEIGHT = 0.35
+DEFAULT_COLOR_WEIGHT = 0.2
 DEFAULT_H_WEIGHT = 2.0
 DEFAULT_S_WEIGHT = 1.0
 DEFAULT_V_WEIGHT = 0.5
@@ -92,13 +93,24 @@ def make_hybrid_vector(
 ) -> list[float]:
     """Combine a CLIP embedding and a color histogram into one L2-normalized vector.
 
-    The output dimension is len(clip_vec) + len(color_vec) (608 for ViT-B-32 + 3*32 bins).
+    Both vectors are independently normalized to unit length before weighting so
+    neither dominates through scale. The color histogram is tiled to match CLIP's
+    dimensionality so it has equal dimensional representation in the dot product.
+    The two are then added (not concatenated), keeping the output at CLIP's
+    native dimension (512 for ViT-B-32).
     """
     cv = np.array(clip_vec, dtype=np.float32)
-    combined = np.concatenate([cv * clip_weight, color_vec * color_weight])
-    norm = np.linalg.norm(combined)
-    if norm > 0:
-        combined /= norm
+
+    # Tile color histogram to match CLIP's dimension so every position carries color signal
+    repeats = math.ceil(cv.shape[0] / color_vec.shape[0])
+    color_padded = np.tile(color_vec, repeats)[: cv.shape[0]].astype(np.float32)
+
+    # Normalize each independently so weights mean exactly what they say
+    cv = cv / (np.linalg.norm(cv) + 1e-8)
+    color_padded = color_padded / (np.linalg.norm(color_padded) + 1e-8)
+
+    combined = (cv * clip_weight) + (color_padded * color_weight)
+    combined /= np.linalg.norm(combined) + 1e-8
     return combined.tolist()
 
 
