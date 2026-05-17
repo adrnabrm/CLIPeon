@@ -46,6 +46,13 @@ _collection = None
 _raw_root: Path = PROJECT_ROOT / "data" / "raw"
 _device = None
 
+FULL_ART_RARITIES = frozenset({
+    "Illustration Rare",
+    "Special Illustration Rare",
+    "Ultra Rare",
+    "Hyper Rare",
+})
+
 
 def _ensure_loaded(model_name: str, pretrained: str, db_path: Path, collection_name: str) -> None:
     global _model, _preprocess, _collection, _device
@@ -56,7 +63,15 @@ def _ensure_loaded(model_name: str, pretrained: str, db_path: Path, collection_n
         _collection = open_chroma_collection(db_path, collection_name)
 
 
-def search(query_image: Image.Image | None, k: int) -> list[tuple[Image.Image, str]]:
+def _raw_path_is_full_art(raw_path: Path) -> bool:
+    return bool(set(raw_path.parts) & FULL_ART_RARITIES)
+
+
+def search(
+    query_image: Image.Image | None,
+    k: int,
+    full_art_only: bool = False,
+) -> list[tuple[Image.Image, str]]:
     if query_image is None:
         return []
 
@@ -73,9 +88,12 @@ def search(query_image: Image.Image | None, k: int) -> list[tuple[Image.Image, s
 
     embedding = embed_image(_model, _preprocess, loaded, _device)
 
+    # Over-fetch when filtering for full art so we have enough candidates.
+    fetch_n = min(int(k) * 20 if full_art_only else int(k), _collection.count())
+
     results = _collection.query(
         query_embeddings=[embedding],
-        n_results=min(int(k), _collection.count()),
+        n_results=fetch_n,
         include=["metadatas", "distances"],
     )
 
@@ -85,15 +103,21 @@ def search(query_image: Image.Image | None, k: int) -> list[tuple[Image.Image, s
         results["metadatas"][0],
         results["distances"][0],
     ):
+        if len(gallery) >= int(k):
+            break
+
         score = 1.0 - dist
         if score >= 0.9999:
             continue
         set_id = meta["set_id"]
-        caption = f"{card_id}  ·  {set_id}  ·  {score:.4f}"
 
         img: Image.Image | None = None
-
         raw_path = find_raw_image(card_id, set_id, _raw_root)
+
+        if full_art_only:
+            if raw_path is None or not _raw_path_is_full_art(raw_path):
+                continue
+
         if raw_path and raw_path.is_file():
             img = Image.open(raw_path).convert("RGB")
 
@@ -105,6 +129,7 @@ def search(query_image: Image.Image | None, k: int) -> list[tuple[Image.Image, s
                     img = Image.open(clean_abs).convert("RGB")
 
         if img is not None:
+            caption = f"{card_id}  ·  {set_id}  ·  {score:.4f}"
             gallery.append((img, caption))
 
     return gallery
@@ -132,6 +157,10 @@ def build_ui() -> gr.Blocks:
                     value=5,
                     label="Top k results",
                 )
+                full_art_checkbox = gr.Checkbox(
+                    value=False,
+                    label="Full Art Only (Illustration Rare / Special IR / Ultra Rare / Hyper Rare)",
+                )
                 search_btn = gr.Button("Search", variant="primary")
 
         results_gallery = gr.Gallery(
@@ -144,7 +173,7 @@ def build_ui() -> gr.Blocks:
 
         search_btn.click(
             fn=search,
-            inputs=[image_input, k_slider],
+            inputs=[image_input, k_slider, full_art_checkbox],
             outputs=results_gallery,
         )
 
