@@ -1,8 +1,8 @@
 # CLIPeon
 
-Visual similarity search for Pokémon TCG card art using [OpenCLIP](https://github.com/mlfoundations/open_clip) and [ChromaDB](https://www.trychroma.com/).
+Visual similarity search for Pokémon TCG card art using [OpenCLIP](https://github.com/mlfoundations/open_clip), [DINOv2](https://github.com/facebookresearch/dinov2), and [ChromaDB](https://www.trychroma.com/).
 
-The pipeline downloads official card images, crops the artwork with layout-aware bounding boxes, embeds the crops with a hybrid CLIP + color signal, and supports nearest-neighbor search against a persistent vector index.
+The pipeline downloads official card images, crops the artwork with layout-aware bounding boxes, embeds the crops using **three independent signals**, and supports nearest-neighbor search with late-fusion scoring against a persistent vector index.
 
 ## Current state
 
@@ -10,8 +10,9 @@ The pipeline downloads official card images, crops the artwork with layout-aware
 |------|--------|
 | Sets in `data/raw` and `data/clean` | **me1**, **me2** |
 | Clean art crops indexed | **318** cards (188 me1 + 130 me2) |
-| Vector DB | Chroma at `data/chroma`, collection `cards` |
+| Vector DB | Chroma at `data/chroma`, collections `cards_clip` / `cards_dino` / `cards_color` |
 | CLIP model | ViT-B-32, OpenAI weights (512-d, cosine) |
+| DINOv2 model | `dinov2_vitb14` via torch.hub (768-d, cosine) |
 | Python env | Conda env `clipeon` (see [Setup](#setup)) |
 
 Scripts are committed; `data/` is gitignored (regenerate locally).
@@ -28,10 +29,10 @@ pokemon-tcg-data JSON
   clean_data.py           →  data/clean/<set>/<id>.png
         │
         ▼
-  clip_actions.py index   →  data/chroma/  (embeddings + metadata)
+  clip_actions.py index   →  data/chroma/  (3 collections + index_params.json)
         │
         ▼
-  clip_actions.py query   →  top-k similar cards (paths into raw)
+  clip_actions.py query   →  top-k similar cards (fused score + per-signal breakdown)
 ```
 
 ## Directory layout
@@ -40,13 +41,16 @@ pokemon-tcg-data JSON
 CLIPeon/
 ├── gather_data.py      # Download raw card images from set JSON
 ├── clean_data.py       # Crop art from raw scans (layout detection)
-├── clip_actions.py     # CLIP embed, index, and similarity query
+├── clip_actions.py     # Three-signal embed, index, and similarity query
 ├── app.py              # Gradio web UI for visual search
 ├── requirements.txt    # Dependencies for clip_actions (clipeon env)
 └── data/               # gitignored
     ├── raw/<set>/<rarity>/        # Full card PNGs (~733×1024)
     ├── clean/<set>/               # Cropped art only
     └── chroma/                    # Persistent vector store
+        ├── cards_clip/            # CLIP embeddings (512-d)
+        ├── cards_dino/            # DINOv2 embeddings (768-d)
+        ├── cards_color/           # HSV color histogram embeddings (96-d)
         └── index_params.json      # Saved embedding parameters (auto-generated)
 ```
 
@@ -61,6 +65,8 @@ pip install -r requirements.txt
 ```
 
 `clean_data.py` and `gather_data.py` only need **Pillow** for cropping; the full stack (torch, open-clip, chromadb, opencv) is required for `clip_actions.py`.
+
+DINOv2 weights are downloaded automatically via `torch.hub` on first indexing or query (~330 MB, cached to `~/.cache/torch/hub`). No extra pip install is needed.
 
 ### Card metadata (gather only)
 
@@ -114,63 +120,77 @@ Shared helpers `crop_card_art()` and `is_full_card_image()` are imported by `cli
 
 ### 3. `clip_actions.py` — embed and search
 
-#### How the embedding works
+#### How the three-signal embedding works
 
-Each card is embedded as a **hybrid vector** that blends two signals:
+Each card is embedded three times — once per signal — and stored in three separate ChromaDB collections. Signals are kept independent so their weights can be tuned or changed without re-running the others.
 
-**CLIP** understands *what* is in the image — whether a scene looks like an ocean, a forest, a battle. It's a 512-dimensional semantic embedding from OpenCLIP (ViT-B-32).
+**CLIP** (512-d) understands *what subject* is in the image. It knows a scene looks like an ocean, a forest, or a battle because it was trained on image–text pairs. It is good at matching cards with the same Pokémon or similar thematic content.
 
-**HSV color histogram** understands *what colors* are in the image — how much red, blue, green, etc. is present, and how vivid or dark. It splits the image's colors into 32 buckets per HSV channel (hue, saturation, value), giving 96 numbers total.
+**DINOv2** (768-d) understands *how the image looks*. Trained purely on visual correspondence (no text), it captures texture, brushwork, composition, and painterly style. It is good at matching cards with a similar artistic style even if the subject differs — e.g., two different Pokémon both rendered in loose watercolor washes.
 
-The two are combined like this:
+**HSV color histogram** (96-d) understands *what palette* is in the image. It splits pixels into 32 buckets per HSV channel (hue, saturation, value), giving 96 numbers that describe the color distribution. Hue is weighted heaviest by default because it identifies the actual color identity of a card (blue ocean, red fire, green forest).
 
-1. The color histogram is tiled to 512 dimensions to match CLIP, so both signals get equal dimensional representation.
-2. Each is independently normalized to unit length, so neither dominates through scale.
-3. They are weighted and added together: `(clip * clip_weight) + (color * color_weight)`.
-4. The result is re-normalized to unit length and stored in ChromaDB.
+#### How search works (late fusion)
 
-This means `clip_weight=0.65, color_weight=0.2` genuinely means "65% CLIP, 20% color" — the weights aren't silently cancelled out by normalization.
+At query time, the query image is embedded by all three models. Each collection independently returns its top-N most similar cards. The three ranked lists are then **union-merged** and each card receives a weighted final score:
+
+```
+final_score = clip_weight × clip_score + dino_weight × dino_score + color_weight × color_score
+```
+
+A card only needs to rank highly in **one or more** signals to be competitive. A card missed by CLIP but found by DINOv2 (similar style, different subject) can still surface in the top results. This is the key advantage over baking everything into a single hybrid vector: each axis remains independently tunable.
 
 #### Tuning the embedding
 
-All parameters are saved to `data/chroma/index_params.json` when you index. Query time (CLI and UI) automatically loads this file so index and query always use the same values — no manual syncing needed.
+All parameters are saved to `data/chroma/index_params.json` when you index. Query time (CLI and UI) automatically loads this file so index and query always stay in sync.
 
 | Parameter | Default | What it controls |
 |-----------|---------|-----------------|
-| `--clip-weight` | `0.65` | How much CLIP's semantic understanding matters |
-| `--color-weight` | `0.20` | How much the color palette matters |
-| `--color-bins` | `32` | Histogram resolution per HSV channel (more bins = finer color discrimination) |
+| `--clip-weight` | `0.40` | How much CLIP's semantic (subject) signal contributes to the final score |
+| `--dino-weight` | `0.40` | How much DINOv2's visual style signal contributes |
+| `--color-weight` | `0.20` | How much the color palette contributes |
+| `--color-bins` | `32` | Histogram resolution per HSV channel (more = finer color discrimination) |
 | `--h-weight` | `2.0` | Relative importance of **hue** (what color) within the histogram |
 | `--s-weight` | `1.0` | Relative importance of **saturation** (how vivid) |
 | `--v-weight` | `0.5` | Relative importance of **value** (how bright/dark) |
-
-Hue is weighted heaviest by default because it captures the actual color identity of a card (blue ocean, red fire, green forest) and is the most useful signal for "find cards with a similar palette."
+| `--dino-model` | `dinov2_vitb14` | DINOv2 variant (`dinov2_vits14` for faster/smaller, `dinov2_vitl14` for stronger) |
 
 **Any time you change these parameters, re-index with `--force`.**
 
+The fusion weights (`clip_weight`, `dino_weight`, `color_weight`) are the exception — they are applied at query time and can be overridden per-query without re-indexing.
+
 #### Index
 
-Embeds every PNG under `data/clean/` and upserts into ChromaDB.
+Embeds every PNG under `data/clean/` into all three ChromaDB collections. DINOv2 weights are downloaded automatically on first run.
 
 ```bash
 conda activate clipeon
 python clip_actions.py index
-python clip_actions.py index --force                        # drop and rebuild collection
-python clip_actions.py index --force --color-weight 0.3    # more color influence
-python clip_actions.py index --force --h-weight 3.0        # hue even more dominant
+python clip_actions.py index --force                        # drop and rebuild all three collections
+python clip_actions.py index --force --color-weight 0.3    # adjust default fusion weight
+python clip_actions.py index --force --h-weight 3.0        # hue even more dominant in palette signal
+python clip_actions.py index --force --dino-model dinov2_vitl14  # use larger DINOv2
 ```
 
 #### Query
 
-Finds the **k** most similar indexed cards. Query images are cropped with the same layout logic when they look like full card scans (width ≥ 700 and height ≥ 900); already-clean art is embedded as-is.
+Finds the **k** most similar indexed cards using three-signal late fusion. Query images are cropped with the same layout logic when they look like full card scans (width ≥ 700 and height ≥ 900); already-clean art is embedded as-is.
 
 ```bash
 python clip_actions.py query path/to/card.png -k 5
 python clip_actions.py query data/raw/me1/Special\ Illustration\ Rare/me1-181_large.png -k 3
 python clip_actions.py query data/clean/me1/me1-181.png -k 5 --no-crop
+
+# Override fusion weights at query time (no re-index needed)
+python clip_actions.py query photo.jpg -k 5 --dino-weight 0.6 --clip-weight 0.2 --color-weight 0.2
 ```
 
-Results print **similarity** (`1 - cosine distance`) and the matching **raw** `*_large.png` path under `data/raw/`.
+Results print the **fused similarity score** and a per-signal breakdown so you can see which axis drove each match:
+
+```
+1. sv7-167  set=sv7  score=0.8731  (clip=0.812 dino=0.921 color=0.788)
+   raw: data/raw/sv7/Special Illustration Rare/sv7-167_large.png
+```
 
 Programmatic API:
 
@@ -185,7 +205,7 @@ hits = query_similar(
     raw_root=Path("data/raw"),
 )
 for hit in hits:
-    print(hit.card_id, hit.score, hit.raw_path)
+    print(hit.card_id, hit.score, hit.clip_score, hit.dino_score, hit.color_score)
 ```
 
 ### 4. `app.py` — web UI
@@ -198,7 +218,9 @@ python app.py
 python app.py --port 7861 --host 0.0.0.0
 ```
 
-The UI loads `data/chroma/index_params.json` at startup and uses the same embedding parameters that were used at index time automatically.
+The UI loads `data/chroma/index_params.json` at startup and uses the same embedding parameters that were used at index time. Both CLIP and DINOv2 models are loaded on startup; expect a brief delay before the first search.
+
+Gallery captions show the fused score plus per-signal breakdown: `C:0.81 D:0.92 Col:0.79`.
 
 Features:
 - Full card scans are auto-cropped to artwork before searching
@@ -216,7 +238,7 @@ python gather_data.py me2
 python clean_data.py me1
 python clean_data.py me2
 
-# 3. Index + search
+# 3. Index (downloads DINOv2 weights on first run) + search
 conda activate clipeon
 pip install -r requirements.txt
 python clip_actions.py index --force
@@ -226,15 +248,16 @@ python clip_actions.py query data/raw/me2/Illustration\ Rare/me2-101_large.png -
 python app.py
 ```
 
-After adding or re-cropping cards, re-run `index` (use `--force` for a full rebuild, or rely on upsert for incremental updates).
+After adding or re-cropping cards, re-run `index` (use `--force` for a full rebuild, or rely on upsert for incremental updates to all three collections).
 
 ## Dependencies
 
 | Package | Used by |
 |---------|---------|
 | Pillow | `clean_data.py`, `clip_actions.py`, `app.py` |
-| torch, torchvision, open-clip-torch | `clip_actions.py` |
-| chromadb | `clip_actions.py` |
+| torch, torchvision | `clip_actions.py` (CLIP + DINOv2 via torch.hub) |
+| open-clip-torch | `clip_actions.py` (CLIP model) |
+| chromadb | `clip_actions.py` (three vector collections) |
 | opencv-python-headless | `clip_actions.py` (HSV color histograms) |
 | numpy | `clip_actions.py` |
 | gradio | `app.py` |
