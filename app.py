@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLIPeon – Gradio card art search UI.
+CLIPeon – Gradio card art search UI (three-signal fusion).
 
 Usage (conda env clipeon):
   python app.py
@@ -19,17 +19,24 @@ try:
     from PIL import Image
 
     from clip_actions import (
-        DEFAULT_COLLECTION,
+        CLIP_COLLECTION,
+        DINO_COLLECTION,
+        COLOR_COLLECTION,
         DEFAULT_MODEL,
         DEFAULT_PRETRAINED,
+        DEFAULT_DINO_MODEL,
         SimilarCard,
-        embed_image_hybrid,
+        embed_image_clip,
+        embed_image_dino,
+        embed_color_vector,
         load_clip,
+        load_dino,
         load_index_params,
         load_query_image,
         open_chroma_collection,
         find_raw_image,
         resolve_device,
+        _fuse_scores,
     )
 except ImportError:
     print(
@@ -41,9 +48,13 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-_model = None
-_preprocess = None
-_collection = None
+_clip_model = None
+_clip_preprocess = None
+_dino_model = None
+_dino_transform = None
+_clip_collection = None
+_dino_collection = None
+_color_collection = None
 _raw_root: Path = PROJECT_ROOT / "data" / "raw"
 _device = None
 _index_params: dict = {}
@@ -54,13 +65,27 @@ FULL_ART_RARITIES = frozenset({
 })
 
 
-def _ensure_loaded(model_name: str, pretrained: str, db_path: Path, collection_name: str) -> None:
-    global _model, _preprocess, _collection, _device, _index_params
-    if _model is None:
+def _ensure_loaded(
+    model_name: str,
+    pretrained: str,
+    dino_model_name: str,
+    db_path: Path,
+) -> None:
+    global _clip_model, _clip_preprocess, _dino_model, _dino_transform
+    global _clip_collection, _dino_collection, _color_collection
+    global _device, _index_params
+
+    if _clip_model is None:
         _device = resolve_device(None)
-        _model, _preprocess = load_clip(model_name, pretrained, _device)
-    if _collection is None:
-        _collection = open_chroma_collection(db_path, collection_name)
+        print(f"Loading CLIP {model_name}/{pretrained}...")
+        _clip_model, _clip_preprocess = load_clip(model_name, pretrained, _device)
+        print(f"Loading DINOv2 {dino_model_name}...")
+        _dino_model, _dino_transform = load_dino(dino_model_name, _device)
+
+    if _clip_collection is None:
+        _clip_collection = open_chroma_collection(db_path, CLIP_COLLECTION)
+        _dino_collection = open_chroma_collection(db_path, DINO_COLLECTION)
+        _color_collection = open_chroma_collection(db_path, COLOR_COLLECTION)
         _index_params = load_index_params(db_path)
 
 
@@ -76,7 +101,9 @@ def search(
     if query_image is None:
         return []
 
-    _ensure_loaded(DEFAULT_MODEL, DEFAULT_PRETRAINED, PROJECT_ROOT / "data" / "chroma", DEFAULT_COLLECTION)
+    dino_model_name = _index_params.get("dino_model", DEFAULT_DINO_MODEL)
+    _ensure_loaded(DEFAULT_MODEL, DEFAULT_PRETRAINED, dino_model_name,
+                   PROJECT_ROOT / "data" / "chroma")
 
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -87,46 +114,82 @@ def search(
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    embedding = embed_image_hybrid(
-        _model, _preprocess, loaded, _device,
-        clip_weight=_index_params["clip_weight"],
-        color_weight=_index_params["color_weight"],
-        color_bins=_index_params["color_bins"],
-        h_weight=_index_params["h_weight"],
-        s_weight=_index_params["s_weight"],
-        v_weight=_index_params["v_weight"],
+    params = _index_params
+    q_clip = embed_image_clip(_clip_model, _clip_preprocess, loaded, _device)
+    q_dino = embed_image_dino(_dino_model, _dino_transform, loaded, _device)
+    q_color = embed_color_vector(
+        loaded,
+        params["color_bins"],
+        params["h_weight"],
+        params["s_weight"],
+        params["v_weight"],
     )
 
-    # Over-fetch when filtering for full art so we have enough candidates.
-    fetch_n = min(int(k) * 20 if full_art_only else int(k), _collection.count())
+    # Use a fixed minimum candidate pool so fusion rankings are stable regardless
+    # of k.  The full-art filter needs a larger pool since most candidates will
+    # be filtered out.  At ~3500 cards these fetches are essentially free.
+    base_k = int(k)
+    min_pool = 400 if full_art_only else 150
+    candidate_n = min(max(base_k * 3, min_pool), _clip_collection.count())
 
-    results = _collection.query(
-        query_embeddings=[embedding],
-        n_results=fetch_n,
+    clip_results = _clip_collection.query(
+        query_embeddings=[q_clip],
+        n_results=candidate_n,
         include=["metadatas", "distances"],
     )
+    dino_results = _dino_collection.query(
+        query_embeddings=[q_dino],
+        n_results=candidate_n,
+        include=["distances"],
+    )
+    color_results = _color_collection.query(
+        query_embeddings=[q_color],
+        n_results=candidate_n,
+        include=["distances"],
+    )
+
+    fused = _fuse_scores(
+        clip_results, dino_results, color_results,
+        params["clip_weight"],
+        params["dino_weight"],
+        params["color_weight"],
+    )
+
+    # Build a metadata lookup from the clip collection results
+    meta_lookup: dict[str, dict] = {
+        id_: meta
+        for id_, meta in zip(clip_results["ids"][0], clip_results["metadatas"][0])
+    }
+    # Back-fill metadata for any card_id that wasn't in the clip top-N but made
+    # the cut after fusion (rare edge case with very unequal signal scores)
+    missing = [t[0] for t in fused[:base_k * 2] if t[0] not in meta_lookup]
+    if missing:
+        extra = _clip_collection.get(ids=missing, include=["metadatas"])
+        for id_, meta in zip(extra["ids"], extra["metadatas"]):
+            meta_lookup[id_] = meta
+
+    # Max possible fused score when all signals return score=1 (exact self-match)
+    max_fused = params["clip_weight"] + params["dino_weight"] + params["color_weight"]
+    self_match_threshold = max_fused * 0.98
 
     gallery: list[tuple[Image.Image, str]] = []
-    for card_id, meta, dist in zip(
-        results["ids"][0],
-        results["metadatas"][0],
-        results["distances"][0],
-    ):
-        if len(gallery) >= int(k):
+    for card_id, fused_score, cs, ds, co in fused:
+        if len(gallery) >= base_k:
             break
 
-        score = 1.0 - dist
-        if score >= 0.9999:
+        # Skip exact self-matches (query image is in the index)
+        if fused_score >= self_match_threshold:
             continue
-        set_id = meta["set_id"]
 
-        img: Image.Image | None = None
+        meta = meta_lookup.get(card_id, {})
+        set_id = meta.get("set_id", "")
         raw_path = find_raw_image(card_id, set_id, _raw_root)
 
         if full_art_only:
             if raw_path is None or not _raw_path_is_full_art(raw_path):
                 continue
 
+        img: Image.Image | None = None
         if raw_path and raw_path.is_file():
             img = Image.open(raw_path).convert("RGB")
 
@@ -138,7 +201,10 @@ def search(
                     img = Image.open(clean_abs).convert("RGB")
 
         if img is not None:
-            caption = f"{card_id}  ·  {set_id}  ·  {score:.4f}"
+            caption = (
+                f"{card_id}  ·  {set_id}  ·  {fused_score:.4f}"
+                f"  (C:{cs:.2f} D:{ds:.2f} Col:{co:.2f})"
+            )
             gallery.append((img, caption))
 
     return gallery
@@ -149,7 +215,9 @@ def build_ui() -> gr.Blocks:
         gr.Markdown("## CLIPeon – Card Art Search")
         gr.Markdown(
             "Upload any Pokémon TCG card image or art crop. "
-            "Full card scans are automatically cropped to their artwork before searching."
+            "Full card scans are automatically cropped to their artwork before searching. "
+            "Results are ranked by three-signal fusion: **CLIP** (subject) · "
+            "**DINOv2** (style) · **Color** (palette)."
         )
 
         with gr.Row():
@@ -161,7 +229,7 @@ def build_ui() -> gr.Blocks:
                 )
                 k_slider = gr.Slider(
                     minimum=1,
-                    maximum=20,
+                    maximum=12,
                     step=1,
                     value=5,
                     label="Top k results",
@@ -194,28 +262,26 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--share", action="store_true", help="Create a public Gradio link")
-    parser.add_argument(
-        "--db-path",
-        type=Path,
-        default=PROJECT_ROOT / "data" / "chroma",
-    )
-    parser.add_argument(
-        "--raw-dir",
-        type=Path,
-        default=PROJECT_ROOT / "data" / "raw",
-    )
+    parser.add_argument("--db-path", type=Path, default=PROJECT_ROOT / "data" / "chroma")
+    parser.add_argument("--raw-dir", type=Path, default=PROJECT_ROOT / "data" / "raw")
     args = parser.parse_args()
 
     global _raw_root
     _raw_root = args.raw_dir.expanduser().resolve()
 
     if not args.db_path.is_dir():
-        print(f"Chroma DB not found at {args.db_path}. Run: python clip_actions.py index", file=sys.stderr)
+        print(
+            f"Chroma DB not found at {args.db_path}. Run:\n"
+            "  python clip_actions.py index",
+            file=sys.stderr,
+        )
         raise SystemExit(1)
 
-    print(f"Pre-loading CLIP model and collection...")
-    _ensure_loaded(DEFAULT_MODEL, DEFAULT_PRETRAINED, args.db_path, DEFAULT_COLLECTION)
-    print(f"Collection has {_collection.count()} cards indexed.")
+    print("Pre-loading models and collections...")
+    saved = load_index_params(args.db_path)
+    dino_model_name = saved.get("dino_model", DEFAULT_DINO_MODEL)
+    _ensure_loaded(DEFAULT_MODEL, DEFAULT_PRETRAINED, dino_model_name, args.db_path)
+    print(f"Collections ready: {_clip_collection.count()} cards indexed.")
 
     demo = build_ui()
     demo.launch(server_name=args.host, server_port=args.port, share=args.share)
