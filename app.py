@@ -51,8 +51,6 @@ _index_params: dict = {}
 FULL_ART_RARITIES = frozenset({
     "Illustration Rare",
     "Special Illustration Rare",
-    "Ultra Rare",
-    "Hyper Rare",
 })
 
 
@@ -170,7 +168,7 @@ def build_ui() -> gr.Blocks:
                 )
                 full_art_checkbox = gr.Checkbox(
                     value=False,
-                    label="Full Art Only (Illustration Rare / Special IR / Ultra Rare / Hyper Rare)",
+                    label="IR / SIR Only (Illustration Rare / Special Illustration Rare)",
                 )
                 search_btn = gr.Button("Search", variant="primary")
 
