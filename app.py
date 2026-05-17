@@ -25,6 +25,7 @@ try:
         SimilarCard,
         embed_image_hybrid,
         load_clip,
+        load_index_params,
         load_query_image,
         open_chroma_collection,
         find_raw_image,
@@ -45,6 +46,7 @@ _preprocess = None
 _collection = None
 _raw_root: Path = PROJECT_ROOT / "data" / "raw"
 _device = None
+_index_params: dict = {}
 
 FULL_ART_RARITIES = frozenset({
     "Illustration Rare",
@@ -55,12 +57,13 @@ FULL_ART_RARITIES = frozenset({
 
 
 def _ensure_loaded(model_name: str, pretrained: str, db_path: Path, collection_name: str) -> None:
-    global _model, _preprocess, _collection, _device
+    global _model, _preprocess, _collection, _device, _index_params
     if _model is None:
         _device = resolve_device(None)
         _model, _preprocess = load_clip(model_name, pretrained, _device)
     if _collection is None:
         _collection = open_chroma_collection(db_path, collection_name)
+        _index_params = load_index_params(db_path)
 
 
 def _raw_path_is_full_art(raw_path: Path) -> bool:
@@ -86,7 +89,12 @@ def search(
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    embedding = embed_image_hybrid(_model, _preprocess, loaded, _device)
+    embedding = embed_image_hybrid(
+        _model, _preprocess, loaded, _device,
+        clip_weight=_index_params["clip_weight"],
+        color_weight=_index_params["color_weight"],
+        color_bins=_index_params["color_bins"],
+    )
 
     # Over-fetch when filtering for full art so we have enough candidates.
     fetch_n = min(int(k) * 20 if full_art_only else int(k), _collection.count())

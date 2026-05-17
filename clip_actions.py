@@ -11,6 +11,7 @@ Usage (conda env clipeon):
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,8 +39,8 @@ DEFAULT_PRETRAINED = "openai"
 DEFAULT_COLLECTION = "cards"
 EMBED_BATCH_SIZE = 32
 DEFAULT_COLOR_BINS = 32
-DEFAULT_CLIP_WEIGHT = 0.85
-DEFAULT_COLOR_WEIGHT = 0.15
+DEFAULT_CLIP_WEIGHT = 0.65
+DEFAULT_COLOR_WEIGHT = 0.35
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,26 @@ def make_hybrid_vector(
 
 def _script_dir() -> Path:
     return Path(__file__).resolve().parent
+
+
+INDEX_PARAMS_FILE = "index_params.json"
+
+
+def save_index_params(db_path: Path, clip_weight: float, color_weight: float, color_bins: int) -> None:
+    params = {"clip_weight": clip_weight, "color_weight": color_weight, "color_bins": color_bins}
+    (db_path / INDEX_PARAMS_FILE).write_text(json.dumps(params, indent=2))
+
+
+def load_index_params(db_path: Path) -> dict:
+    """Load saved index parameters, falling back to defaults if the file is missing."""
+    params_path = db_path / INDEX_PARAMS_FILE
+    if params_path.is_file():
+        return json.loads(params_path.read_text())
+    return {
+        "clip_weight": DEFAULT_CLIP_WEIGHT,
+        "color_weight": DEFAULT_COLOR_WEIGHT,
+        "color_bins": DEFAULT_COLOR_BINS,
+    }
 
 
 def discover_cards(clean_root: Path) -> list[CardImage]:
@@ -235,13 +256,19 @@ def query_similar(
     pretrained: str = DEFAULT_PRETRAINED,
     device: torch.device | None = None,
     crop: bool = True,
-    clip_weight: float = DEFAULT_CLIP_WEIGHT,
-    color_weight: float = DEFAULT_COLOR_WEIGHT,
-    color_bins: int = DEFAULT_COLOR_BINS,
+    clip_weight: float | None = None,
+    color_weight: float | None = None,
+    color_bins: int | None = None,
 ) -> list[SimilarCard]:
     image_path = image_path.expanduser().resolve()
     if not image_path.is_file():
         raise FileNotFoundError(f"Image not found: {image_path}")
+
+    # Resolve hybrid parameters: explicit args > sidecar file > built-in defaults
+    saved = load_index_params(db_path)
+    clip_weight = clip_weight if clip_weight is not None else saved["clip_weight"]
+    color_weight = color_weight if color_weight is not None else saved["color_weight"]
+    color_bins = color_bins if color_bins is not None else saved["color_bins"]
 
     dev = device or resolve_device(None)
     model, preprocess = load_clip(model_name, pretrained, dev)
@@ -305,17 +332,21 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"No PNG files under {clean_root}", file=sys.stderr)
         return 1
 
+    clip_weight = args.clip_weight if args.clip_weight is not None else DEFAULT_CLIP_WEIGHT
+    color_weight = args.color_weight if args.color_weight is not None else DEFAULT_COLOR_WEIGHT
+    color_bins = args.color_bins if args.color_bins is not None else DEFAULT_COLOR_BINS
+
     device = resolve_device(args.device)
     print(f"Device: {device}")
     print(f"Loading CLIP {args.model}/{args.pretrained}...")
     model, preprocess = load_clip(args.model, args.pretrained, device)
 
-    print(f"Embedding {len(cards)} cards (clip_weight={args.clip_weight}, color_weight={args.color_weight}, color_bins={args.color_bins})...")
+    print(f"Embedding {len(cards)} cards (clip_weight={clip_weight}, color_weight={color_weight}, color_bins={color_bins})...")
     embeddings = embed_cards(
         model, preprocess, cards, device, args.batch_size,
-        clip_weight=args.clip_weight,
-        color_weight=args.color_weight,
-        color_bins=args.color_bins,
+        clip_weight=clip_weight,
+        color_weight=color_weight,
+        color_bins=color_bins,
     )
 
     collection = get_chroma_collection(db_path, args.collection, reset=args.force)
@@ -330,6 +361,8 @@ def cmd_index(args: argparse.Namespace) -> int:
         metadatas=metadatas,
         documents=documents,
     )
+
+    save_index_params(db_path, clip_weight, color_weight, color_bins)
 
     print(
         f"Indexed {len(cards)} cards -> {db_path} "
@@ -401,20 +434,20 @@ def _add_clip_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--clip-weight",
         type=float,
-        default=DEFAULT_CLIP_WEIGHT,
-        help=f"Weight applied to CLIP embedding in hybrid vector (default: {DEFAULT_CLIP_WEIGHT})",
+        default=None,
+        help=f"Weight applied to CLIP embedding in hybrid vector (default: read from index_params.json, else {DEFAULT_CLIP_WEIGHT})",
     )
     parser.add_argument(
         "--color-weight",
         type=float,
-        default=DEFAULT_COLOR_WEIGHT,
-        help=f"Weight applied to HSV color histogram in hybrid vector (default: {DEFAULT_COLOR_WEIGHT})",
+        default=None,
+        help=f"Weight applied to HSV color histogram in hybrid vector (default: read from index_params.json, else {DEFAULT_COLOR_WEIGHT})",
     )
     parser.add_argument(
         "--color-bins",
         type=int,
-        default=DEFAULT_COLOR_BINS,
-        help=f"Number of histogram bins per HSV channel (default: {DEFAULT_COLOR_BINS})",
+        default=None,
+        help=f"Number of histogram bins per HSV channel (default: read from index_params.json, else {DEFAULT_COLOR_BINS})",
     )
 
 
