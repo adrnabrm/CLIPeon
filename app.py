@@ -94,6 +94,9 @@ def search(
         clip_weight=_index_params["clip_weight"],
         color_weight=_index_params["color_weight"],
         color_bins=_index_params["color_bins"],
+        h_weight=_index_params["h_weight"],
+        s_weight=_index_params["s_weight"],
+        v_weight=_index_params["v_weight"],
     )
 
     # Over-fetch when filtering for full art so we have enough candidates.

@@ -41,6 +41,9 @@ EMBED_BATCH_SIZE = 32
 DEFAULT_COLOR_BINS = 32
 DEFAULT_CLIP_WEIGHT = 0.65
 DEFAULT_COLOR_WEIGHT = 0.35
+DEFAULT_H_WEIGHT = 2.0
+DEFAULT_S_WEIGHT = 1.0
+DEFAULT_V_WEIGHT = 0.5
 
 
 @dataclass(frozen=True)
@@ -59,17 +62,25 @@ class SimilarCard:
     clean_path: str | None
 
 
-def color_histogram(pil_img: Image.Image, bins: int = DEFAULT_COLOR_BINS) -> np.ndarray:
-    """Compute a normalized HSV color histogram from a PIL RGB image.
+def color_histogram(
+    pil_img: Image.Image,
+    bins: int = DEFAULT_COLOR_BINS,
+    h_weight: float = DEFAULT_H_WEIGHT,
+    s_weight: float = DEFAULT_S_WEIGHT,
+    v_weight: float = DEFAULT_V_WEIGHT,
+) -> np.ndarray:
+    """Compute a weighted HSV color histogram from a PIL RGB image.
 
-    Returns a float32 array of shape (3*bins,): H bins (0-180) followed by
-    S and V bins (0-256), all concatenated and L1-normalized so they sum to 1.
+    Each channel histogram is scaled by its weight before concatenation, giving
+    hue more influence by default (h_weight=2.0, s_weight=1.0, v_weight=0.5).
+    The result is L1-normalized so the total magnitude reflects the weights.
+    Output shape: (3*bins,).
     """
     hsv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2HSV)
-    h_hist = np.histogram(hsv[:, :, 0], bins=bins, range=(0, 180))[0]
-    s_hist = np.histogram(hsv[:, :, 1], bins=bins, range=(0, 256))[0]
-    v_hist = np.histogram(hsv[:, :, 2], bins=bins, range=(0, 256))[0]
-    hist = np.concatenate([h_hist, s_hist, v_hist]).astype(np.float32)
+    h_hist = np.histogram(hsv[:, :, 0], bins=bins, range=(0, 180))[0].astype(np.float32) * h_weight
+    s_hist = np.histogram(hsv[:, :, 1], bins=bins, range=(0, 256))[0].astype(np.float32) * s_weight
+    v_hist = np.histogram(hsv[:, :, 2], bins=bins, range=(0, 256))[0].astype(np.float32) * v_weight
+    hist = np.concatenate([h_hist, s_hist, v_hist])
     return hist / hist.sum()
 
 
@@ -98,8 +109,23 @@ def _script_dir() -> Path:
 INDEX_PARAMS_FILE = "index_params.json"
 
 
-def save_index_params(db_path: Path, clip_weight: float, color_weight: float, color_bins: int) -> None:
-    params = {"clip_weight": clip_weight, "color_weight": color_weight, "color_bins": color_bins}
+def save_index_params(
+    db_path: Path,
+    clip_weight: float,
+    color_weight: float,
+    color_bins: int,
+    h_weight: float,
+    s_weight: float,
+    v_weight: float,
+) -> None:
+    params = {
+        "clip_weight": clip_weight,
+        "color_weight": color_weight,
+        "color_bins": color_bins,
+        "h_weight": h_weight,
+        "s_weight": s_weight,
+        "v_weight": v_weight,
+    }
     (db_path / INDEX_PARAMS_FILE).write_text(json.dumps(params, indent=2))
 
 
@@ -107,11 +133,19 @@ def load_index_params(db_path: Path) -> dict:
     """Load saved index parameters, falling back to defaults if the file is missing."""
     params_path = db_path / INDEX_PARAMS_FILE
     if params_path.is_file():
-        return json.loads(params_path.read_text())
+        saved = json.loads(params_path.read_text())
+        # Back-fill channel weights for indexes created before this field existed
+        saved.setdefault("h_weight", DEFAULT_H_WEIGHT)
+        saved.setdefault("s_weight", DEFAULT_S_WEIGHT)
+        saved.setdefault("v_weight", DEFAULT_V_WEIGHT)
+        return saved
     return {
         "clip_weight": DEFAULT_CLIP_WEIGHT,
         "color_weight": DEFAULT_COLOR_WEIGHT,
         "color_bins": DEFAULT_COLOR_BINS,
+        "h_weight": DEFAULT_H_WEIGHT,
+        "s_weight": DEFAULT_S_WEIGHT,
+        "v_weight": DEFAULT_V_WEIGHT,
     }
 
 
@@ -165,6 +199,9 @@ def embed_cards(
     clip_weight: float = DEFAULT_CLIP_WEIGHT,
     color_weight: float = DEFAULT_COLOR_WEIGHT,
     color_bins: int = DEFAULT_COLOR_BINS,
+    h_weight: float = DEFAULT_H_WEIGHT,
+    s_weight: float = DEFAULT_S_WEIGHT,
+    v_weight: float = DEFAULT_V_WEIGHT,
 ) -> list[list[float]]:
     if not cards:
         return []
@@ -190,7 +227,7 @@ def embed_cards(
             feats = feats / feats.norm(dim=-1, keepdim=True)
             clip_vecs = feats.cpu().tolist()
             for clip_vec, pil_img in zip(clip_vecs, pil_images):
-                color_vec = color_histogram(pil_img, bins=color_bins)
+                color_vec = color_histogram(pil_img, bins=color_bins, h_weight=h_weight, s_weight=s_weight, v_weight=v_weight)
                 vectors.append(make_hybrid_vector(clip_vec, color_vec, clip_weight, color_weight))
     return vectors
 
@@ -225,10 +262,13 @@ def embed_image_hybrid(
     clip_weight: float = DEFAULT_CLIP_WEIGHT,
     color_weight: float = DEFAULT_COLOR_WEIGHT,
     color_bins: int = DEFAULT_COLOR_BINS,
+    h_weight: float = DEFAULT_H_WEIGHT,
+    s_weight: float = DEFAULT_S_WEIGHT,
+    v_weight: float = DEFAULT_V_WEIGHT,
 ) -> list[float]:
     """Produce a hybrid CLIP + HSV color histogram vector for a single image."""
     clip_vec = embed_image(model, preprocess, image, device)
-    color_vec = color_histogram(image, bins=color_bins)
+    color_vec = color_histogram(image, bins=color_bins, h_weight=h_weight, s_weight=s_weight, v_weight=v_weight)
     return make_hybrid_vector(clip_vec, color_vec, clip_weight, color_weight)
 
 
@@ -259,6 +299,9 @@ def query_similar(
     clip_weight: float | None = None,
     color_weight: float | None = None,
     color_bins: int | None = None,
+    h_weight: float | None = None,
+    s_weight: float | None = None,
+    v_weight: float | None = None,
 ) -> list[SimilarCard]:
     image_path = image_path.expanduser().resolve()
     if not image_path.is_file():
@@ -269,11 +312,14 @@ def query_similar(
     clip_weight = clip_weight if clip_weight is not None else saved["clip_weight"]
     color_weight = color_weight if color_weight is not None else saved["color_weight"]
     color_bins = color_bins if color_bins is not None else saved["color_bins"]
+    h_weight = h_weight if h_weight is not None else saved["h_weight"]
+    s_weight = s_weight if s_weight is not None else saved["s_weight"]
+    v_weight = v_weight if v_weight is not None else saved["v_weight"]
 
     dev = device or resolve_device(None)
     model, preprocess = load_clip(model_name, pretrained, dev)
     query_image = load_query_image(image_path, crop=crop)
-    embedding = embed_image_hybrid(model, preprocess, query_image, dev, clip_weight, color_weight, color_bins)
+    embedding = embed_image_hybrid(model, preprocess, query_image, dev, clip_weight, color_weight, color_bins, h_weight, s_weight, v_weight)
 
     collection = open_chroma_collection(db_path, collection_name)
     if collection.count() == 0:
@@ -335,18 +381,28 @@ def cmd_index(args: argparse.Namespace) -> int:
     clip_weight = args.clip_weight if args.clip_weight is not None else DEFAULT_CLIP_WEIGHT
     color_weight = args.color_weight if args.color_weight is not None else DEFAULT_COLOR_WEIGHT
     color_bins = args.color_bins if args.color_bins is not None else DEFAULT_COLOR_BINS
+    h_weight = args.h_weight if args.h_weight is not None else DEFAULT_H_WEIGHT
+    s_weight = args.s_weight if args.s_weight is not None else DEFAULT_S_WEIGHT
+    v_weight = args.v_weight if args.v_weight is not None else DEFAULT_V_WEIGHT
 
     device = resolve_device(args.device)
     print(f"Device: {device}")
     print(f"Loading CLIP {args.model}/{args.pretrained}...")
     model, preprocess = load_clip(args.model, args.pretrained, device)
 
-    print(f"Embedding {len(cards)} cards (clip_weight={clip_weight}, color_weight={color_weight}, color_bins={color_bins})...")
+    print(
+        f"Embedding {len(cards)} cards "
+        f"(clip_weight={clip_weight}, color_weight={color_weight}, color_bins={color_bins}, "
+        f"h_weight={h_weight}, s_weight={s_weight}, v_weight={v_weight})..."
+    )
     embeddings = embed_cards(
         model, preprocess, cards, device, args.batch_size,
         clip_weight=clip_weight,
         color_weight=color_weight,
         color_bins=color_bins,
+        h_weight=h_weight,
+        s_weight=s_weight,
+        v_weight=v_weight,
     )
 
     collection = get_chroma_collection(db_path, args.collection, reset=args.force)
@@ -362,7 +418,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         documents=documents,
     )
 
-    save_index_params(db_path, clip_weight, color_weight, color_bins)
+    save_index_params(db_path, clip_weight, color_weight, color_bins, h_weight, s_weight, v_weight)
 
     print(
         f"Indexed {len(cards)} cards -> {db_path} "
@@ -389,6 +445,9 @@ def cmd_query(args: argparse.Namespace) -> int:
             clip_weight=args.clip_weight,
             color_weight=args.color_weight,
             color_bins=args.color_bins,
+            h_weight=args.h_weight,
+            s_weight=args.s_weight,
+            v_weight=args.v_weight,
         )
     except (FileNotFoundError, RuntimeError) as e:
         print(e, file=sys.stderr)
@@ -448,6 +507,24 @@ def _add_clip_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help=f"Number of histogram bins per HSV channel (default: read from index_params.json, else {DEFAULT_COLOR_BINS})",
+    )
+    parser.add_argument(
+        "--h-weight",
+        type=float,
+        default=None,
+        help=f"Scale factor for the Hue histogram channel (default: read from index_params.json, else {DEFAULT_H_WEIGHT})",
+    )
+    parser.add_argument(
+        "--s-weight",
+        type=float,
+        default=None,
+        help=f"Scale factor for the Saturation histogram channel (default: read from index_params.json, else {DEFAULT_S_WEIGHT})",
+    )
+    parser.add_argument(
+        "--v-weight",
+        type=float,
+        default=None,
+        help=f"Scale factor for the Value histogram channel (default: read from index_params.json, else {DEFAULT_V_WEIGHT})",
     )
 
 
