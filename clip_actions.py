@@ -525,9 +525,8 @@ def query_similar(
     if total == 0:
         raise RuntimeError("Collections are empty; run: python clip_actions.py index")
 
-    # Over-fetch so late fusion can surface cards that scored high in ≥1 signal
-    # but not necessarily top-k in all three.
-    candidate_n = min(k * 10, total)
+    # Fixed minimum pool keeps fusion rankings stable across different k values.
+    candidate_n = min(max(k * 3, 150), total)
 
     clip_results = clip_col.query(query_embeddings=[q_clip], n_results=candidate_n,
                                   include=["metadatas", "distances"])

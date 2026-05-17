@@ -125,12 +125,12 @@ def search(
         params["v_weight"],
     )
 
-    # Over-fetch when filtering for full art so we have enough candidates after
-    # the rarity filter.  Also over-fetch for late fusion so each signal can
-    # surface cards the others might have ranked lower.
+    # Use a fixed minimum candidate pool so fusion rankings are stable regardless
+    # of k.  The full-art filter needs a larger pool since most candidates will
+    # be filtered out.  At ~3500 cards these fetches are essentially free.
     base_k = int(k)
-    multiplier = 20 if full_art_only else 5
-    candidate_n = min(base_k * multiplier, _clip_collection.count())
+    min_pool = 400 if full_art_only else 150
+    candidate_n = min(max(base_k * 3, min_pool), _clip_collection.count())
 
     clip_results = _clip_collection.query(
         query_embeddings=[q_clip],
