@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
+    import cv2
     import chromadb
+    import numpy as np
     import open_clip
     import torch
     from PIL import Image
@@ -35,6 +37,9 @@ DEFAULT_MODEL = "ViT-B-32"
 DEFAULT_PRETRAINED = "openai"
 DEFAULT_COLLECTION = "cards"
 EMBED_BATCH_SIZE = 32
+DEFAULT_COLOR_BINS = 32
+DEFAULT_CLIP_WEIGHT = 0.85
+DEFAULT_COLOR_WEIGHT = 0.15
 
 
 @dataclass(frozen=True)
@@ -51,6 +56,38 @@ class SimilarCard:
     score: float
     raw_path: Path | None
     clean_path: str | None
+
+
+def color_histogram(pil_img: Image.Image, bins: int = DEFAULT_COLOR_BINS) -> np.ndarray:
+    """Compute a normalized HSV color histogram from a PIL RGB image.
+
+    Returns a float32 array of shape (3*bins,): H bins (0-180) followed by
+    S and V bins (0-256), all concatenated and L1-normalized so they sum to 1.
+    """
+    hsv = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2HSV)
+    h_hist = np.histogram(hsv[:, :, 0], bins=bins, range=(0, 180))[0]
+    s_hist = np.histogram(hsv[:, :, 1], bins=bins, range=(0, 256))[0]
+    v_hist = np.histogram(hsv[:, :, 2], bins=bins, range=(0, 256))[0]
+    hist = np.concatenate([h_hist, s_hist, v_hist]).astype(np.float32)
+    return hist / hist.sum()
+
+
+def make_hybrid_vector(
+    clip_vec: list[float] | np.ndarray,
+    color_vec: np.ndarray,
+    clip_weight: float = DEFAULT_CLIP_WEIGHT,
+    color_weight: float = DEFAULT_COLOR_WEIGHT,
+) -> list[float]:
+    """Combine a CLIP embedding and a color histogram into one L2-normalized vector.
+
+    The output dimension is len(clip_vec) + len(color_vec) (608 for ViT-B-32 + 3*32 bins).
+    """
+    cv = np.array(clip_vec, dtype=np.float32)
+    combined = np.concatenate([cv * clip_weight, color_vec * color_weight])
+    norm = np.linalg.norm(combined)
+    if norm > 0:
+        combined /= norm
+    return combined.tolist()
 
 
 def _script_dir() -> Path:
@@ -95,7 +132,7 @@ class _ImageDataset(Dataset):
     def __getitem__(self, idx: int):
         card = self.cards[idx]
         image = Image.open(card.path).convert("RGB")
-        return self.preprocess(image), card
+        return self.preprocess(image), image, card
 
 
 def embed_cards(
@@ -104,6 +141,9 @@ def embed_cards(
     cards: list[CardImage],
     device: torch.device,
     batch_size: int,
+    clip_weight: float = DEFAULT_CLIP_WEIGHT,
+    color_weight: float = DEFAULT_COLOR_WEIGHT,
+    color_bins: int = DEFAULT_COLOR_BINS,
 ) -> list[list[float]]:
     if not cards:
         return []
@@ -116,17 +156,21 @@ def embed_cards(
         num_workers=0,
         collate_fn=lambda batch: (
             torch.stack([b[0] for b in batch]),
-            [b[1] for b in batch],
+            [b[1] for b in batch],   # PIL images for color histogram
+            [b[2] for b in batch],   # CardImage metadata
         ),
     )
 
     vectors: list[list[float]] = []
     with torch.inference_mode():
-        for images, _batch_cards in loader:
+        for images, pil_images, _batch_cards in loader:
             images = images.to(device)
             feats = model.encode_image(images)
             feats = feats / feats.norm(dim=-1, keepdim=True)
-            vectors.extend(feats.cpu().tolist())
+            clip_vecs = feats.cpu().tolist()
+            for clip_vec, pil_img in zip(clip_vecs, pil_images):
+                color_vec = color_histogram(pil_img, bins=color_bins)
+                vectors.append(make_hybrid_vector(clip_vec, color_vec, clip_weight, color_weight))
     return vectors
 
 
@@ -150,6 +194,21 @@ def embed_image(
         feats = model.encode_image(tensor)
         feats = feats / feats.norm(dim=-1, keepdim=True)
     return feats.cpu().tolist()[0]
+
+
+def embed_image_hybrid(
+    model,
+    preprocess,
+    image: Image.Image,
+    device: torch.device,
+    clip_weight: float = DEFAULT_CLIP_WEIGHT,
+    color_weight: float = DEFAULT_COLOR_WEIGHT,
+    color_bins: int = DEFAULT_COLOR_BINS,
+) -> list[float]:
+    """Produce a hybrid CLIP + HSV color histogram vector for a single image."""
+    clip_vec = embed_image(model, preprocess, image, device)
+    color_vec = color_histogram(image, bins=color_bins)
+    return make_hybrid_vector(clip_vec, color_vec, clip_weight, color_weight)
 
 
 def find_raw_image(card_id: str, set_id: str, raw_root: Path) -> Path | None:
@@ -176,6 +235,9 @@ def query_similar(
     pretrained: str = DEFAULT_PRETRAINED,
     device: torch.device | None = None,
     crop: bool = True,
+    clip_weight: float = DEFAULT_CLIP_WEIGHT,
+    color_weight: float = DEFAULT_COLOR_WEIGHT,
+    color_bins: int = DEFAULT_COLOR_BINS,
 ) -> list[SimilarCard]:
     image_path = image_path.expanduser().resolve()
     if not image_path.is_file():
@@ -184,7 +246,7 @@ def query_similar(
     dev = device or resolve_device(None)
     model, preprocess = load_clip(model_name, pretrained, dev)
     query_image = load_query_image(image_path, crop=crop)
-    embedding = embed_image(model, preprocess, query_image, dev)
+    embedding = embed_image_hybrid(model, preprocess, query_image, dev, clip_weight, color_weight, color_bins)
 
     collection = open_chroma_collection(db_path, collection_name)
     if collection.count() == 0:
@@ -248,9 +310,12 @@ def cmd_index(args: argparse.Namespace) -> int:
     print(f"Loading CLIP {args.model}/{args.pretrained}...")
     model, preprocess = load_clip(args.model, args.pretrained, device)
 
-    print(f"Embedding {len(cards)} cards...")
+    print(f"Embedding {len(cards)} cards (clip_weight={args.clip_weight}, color_weight={args.color_weight}, color_bins={args.color_bins})...")
     embeddings = embed_cards(
-        model, preprocess, cards, device, args.batch_size
+        model, preprocess, cards, device, args.batch_size,
+        clip_weight=args.clip_weight,
+        color_weight=args.color_weight,
+        color_bins=args.color_bins,
     )
 
     collection = get_chroma_collection(db_path, args.collection, reset=args.force)
@@ -288,6 +353,9 @@ def cmd_query(args: argparse.Namespace) -> int:
             pretrained=args.pretrained,
             device=resolve_device(args.device),
             crop=not args.no_crop,
+            clip_weight=args.clip_weight,
+            color_weight=args.color_weight,
+            color_bins=args.color_bins,
         )
     except (FileNotFoundError, RuntimeError) as e:
         print(e, file=sys.stderr)
@@ -329,6 +397,24 @@ def _add_clip_args(parser: argparse.ArgumentParser) -> None:
         "--device",
         default=None,
         help="Torch device (default: cuda if available else cpu)",
+    )
+    parser.add_argument(
+        "--clip-weight",
+        type=float,
+        default=DEFAULT_CLIP_WEIGHT,
+        help=f"Weight applied to CLIP embedding in hybrid vector (default: {DEFAULT_CLIP_WEIGHT})",
+    )
+    parser.add_argument(
+        "--color-weight",
+        type=float,
+        default=DEFAULT_COLOR_WEIGHT,
+        help=f"Weight applied to HSV color histogram in hybrid vector (default: {DEFAULT_COLOR_WEIGHT})",
+    )
+    parser.add_argument(
+        "--color-bins",
+        type=int,
+        default=DEFAULT_COLOR_BINS,
+        help=f"Number of histogram bins per HSV channel (default: {DEFAULT_COLOR_BINS})",
     )
 
 

@@ -23,7 +23,7 @@ try:
         DEFAULT_MODEL,
         DEFAULT_PRETRAINED,
         SimilarCard,
-        embed_image,
+        embed_image_hybrid,
         load_clip,
         load_query_image,
         open_chroma_collection,
@@ -86,7 +86,7 @@ def search(
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    embedding = embed_image(_model, _preprocess, loaded, _device)
+    embedding = embed_image_hybrid(_model, _preprocess, loaded, _device)
 
     # Over-fetch when filtering for full art so we have enough candidates.
     fetch_n = min(int(k) * 20 if full_art_only else int(k), _collection.count())
