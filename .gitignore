@@ -22,3 +22,5 @@ data/
 *.swp
 *~
 .DS_Store
+
+EVOLUTION.md
