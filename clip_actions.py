@@ -618,6 +618,30 @@ def query_similar(
 
 
 # ---------------------------------------------------------------------------
+# ChromaDB batch helper
+# ---------------------------------------------------------------------------
+
+_CHROMA_MAX_BATCH = 5000  # Chroma's hard limit is 5461; stay safely below it
+
+
+def _chroma_upsert_batched(
+    collection,
+    ids: list[str],
+    embeddings: list,
+    metadatas: list[dict],
+    documents: list[str],
+) -> None:
+    for start in range(0, len(ids), _CHROMA_MAX_BATCH):
+        end = start + _CHROMA_MAX_BATCH
+        collection.upsert(
+            ids=ids[start:end],
+            embeddings=embeddings[start:end],
+            metadatas=metadatas[start:end],
+            documents=documents[start:end],
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI: index
 # ---------------------------------------------------------------------------
 
@@ -670,9 +694,9 @@ def cmd_index(args: argparse.Namespace) -> int:
     dino_col = get_chroma_collection(db_path, DINO_COLLECTION, reset=args.force)
     color_col = get_chroma_collection(db_path, COLOR_COLLECTION, reset=args.force)
 
-    clip_col.upsert(ids=ids, embeddings=clip_vecs, metadatas=metadatas, documents=documents)
-    dino_col.upsert(ids=ids, embeddings=dino_vecs, metadatas=metadatas, documents=documents)
-    color_col.upsert(ids=ids, embeddings=color_vecs, metadatas=metadatas, documents=documents)
+    _chroma_upsert_batched(clip_col, ids, clip_vecs, metadatas, documents)
+    _chroma_upsert_batched(dino_col, ids, dino_vecs, metadatas, documents)
+    _chroma_upsert_batched(color_col, ids, color_vecs, metadatas, documents)
 
     save_index_params(
         db_path, clip_weight, dino_weight, color_weight,
