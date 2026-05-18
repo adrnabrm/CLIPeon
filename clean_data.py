@@ -32,13 +32,22 @@ FULL_HEADER_ART_BOX = (30, 110, 704, 870)
 
 HEADER_PROBE_Y = 80
 HEADER_LUM_THRESHOLD = 200
-SILVER_BORDER_LUM_THRESHOLD = 180
+FRAME_BORDER_LUM_THRESHOLD = 180
+# SWSH holo frames are bright yellow/gold (high saturation), not grey silver.
+FRAME_BORDER_SAT_THRESHOLD = 90
+# Standard art ends ~y=510; full arts with yellow borders still have illustration below.
+BELOW_STANDARD_ART_Y = 620
+BELOW_ART_FULL_SAT_THRESHOLD = 55
 
 # Always use standard art crop (same as Common / Uncommon / Rare).
 STANDARD_RARITIES = frozenset({
     "Common",
     "Uncommon",
     "Rare",
+    "Rare Holo",  # SWSH
+    "Amazing Rare",
+    "Radiant Rare",
+    "Rare Shiny",
     "Double Rare",
     "Shiny",
     "Shiny Rare",
@@ -51,6 +60,14 @@ FULL_ART_RARITIES = frozenset({
     "Mega Hyper Rare",
     "Hyper Rare",
     "Shiny Ultra Rare",
+    # SWSH (V / VMAX / VSTAR / rainbow / gold / full-art trainers)
+    "Rare Holo V",
+    "Rare Holo VMAX",
+    "Rare Holo VSTAR",
+    "Rare Rainbow",
+    "Rare Secret",
+    "Rare Ultra",
+    "Trainer Gallery Rare Holo",
 })
 
 
@@ -67,11 +84,51 @@ def _get_pixel(im: Image.Image, x: int, y: int) -> tuple[int, int, int]:
     return im.getpixel((min(x, im.width - 1), min(y, im.height - 1)))
 
 
-def _has_silver_art_border(im: Image.Image) -> bool:
+def _rgb_saturation(rgb: tuple[int, int, int]) -> float:
+    r, g, b = rgb
+    mx, mn = max(r, g, b), min(r, g, b)
+    if mx == 0:
+        return 0.0
+    return (mx - mn) / mx * 255.0
+
+
+def _border_sample_stats(im: Image.Image) -> tuple[float, float]:
     w, h = im.size
-    samples = ((15, min(200, h - 1)), (15, min(350, h - 1)), (min(718, w - 1), min(200, h - 1)))
-    lums = [_luminance(_get_pixel(im, x, y)) for x, y in samples]
-    return sum(lums) / len(lums) > SILVER_BORDER_LUM_THRESHOLD
+    samples = (
+        (15, min(200, h - 1)),
+        (15, min(350, h - 1)),
+        (min(718, w - 1), min(200, h - 1)),
+    )
+    lums: list[float] = []
+    sats: list[float] = []
+    for x, y in samples:
+        rgb = _get_pixel(im, x, y)
+        lums.append(_luminance(rgb))
+        sats.append(_rgb_saturation(rgb))
+    return sum(lums) / len(lums), sum(sats) / len(sats)
+
+
+def _art_extends_below_standard_frame(im: Image.Image) -> bool:
+    """True when illustration continues below the standard art window (yellow-border full arts)."""
+    w, h = im.size
+    x = min(350, w - 1)
+    y = min(BELOW_STANDARD_ART_Y, h - 1)
+    return _rgb_saturation(_get_pixel(im, x, y)) > BELOW_ART_FULL_SAT_THRESHOLD
+
+
+def _has_standard_frame_border(im: Image.Image) -> bool:
+    """Detect classic framed layout (silver or SWSH yellow holo), not full-art borderless."""
+    avg_lum, avg_sat = _border_sample_stats(im)
+    if avg_lum <= FRAME_BORDER_LUM_THRESHOLD:
+        return False
+    if avg_sat <= FRAME_BORDER_SAT_THRESHOLD:
+        return True
+    return not _art_extends_below_standard_frame(im)
+
+
+def _has_silver_art_border(im: Image.Image) -> bool:
+    """Alias kept for readability; includes SWSH yellow holo frame handling."""
+    return _has_standard_frame_border(im)
 
 
 def _header_row_luminance(im: Image.Image) -> float:
