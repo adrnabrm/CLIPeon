@@ -224,8 +224,24 @@ Gallery captions show the fused score plus per-signal breakdown: `C:0.81 D:0.92 
 
 Features:
 - Full card scans are auto-cropped to artwork before searching
-- **Top k** slider (1–20)
+- **Top k** slider (1–12)
 - **IR / SIR Only** filter (Illustration Rare / Special Illustration Rare)
+
+#### Label eval tab
+
+Use the **Label eval** tab to build a dataset for tuning fusion weights later:
+
+1. A random card image is picked from `data/raw` (already-labeled queries are skipped). Enable **IR / SIR Only** to limit both random queries and search results to Illustration Rare / Special Illustration Rare.
+2. Click **Run query** to fetch 12 similar cards.
+3. Click a result, then rate it: **0** (not relevant), **1** (kinda relevant), **2** (ideal).
+4. **Save & next** appends one JSON line to `data/eval/labels.jsonl` (only results you rated).
+5. **Skip** or **New random** picks another query without saving.
+
+```bash
+python app.py --labels-path data/eval/labels.jsonl
+```
+
+Each saved record includes the query card id, paths, current `index_params` snapshot, and per-result ranks/scores/relevance. A future eval script can read this file to sweep `clip_weight` / `dino_weight` / `color_weight`.
 
 ## Typical workflow
 
