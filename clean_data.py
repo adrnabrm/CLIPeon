@@ -3,9 +3,9 @@
 Crop card art from raw images into data/clean/<set_id>/.
 
 Layout is chosen per rarity hint and/or image detection:
-  - Standard (Common, Shiny Rare, …):      (30, 110, 704, 510)
-  - Full-art borderless:                   (30,  30, 704, 870)
-  - Full-art with large title bar/header:  (30, 110, 704, 870)
+  - Standard (Common, Shiny Rare, …):                        (30, 110, 704, 510)
+  - Full-art borderless (SIR, Ultra Rare, …):                (30,  30, 704, 870)
+  - Full-art with large title bar/header (IR, Ultra Rare, …):(30, 110, 704, 870)
 
 Usage:
   python clean_data.py            # all raw sets missing from data/clean
@@ -56,6 +56,7 @@ STANDARD_RARITIES = frozenset({
 # Full-art family: header vs borderless detection only (no silver-frame check).
 FULL_ART_RARITIES = frozenset({
     "Ultra Rare",
+    "Illustration Rare",
     "Special Illustration Rare",
     "Mega Hyper Rare",
     "Hyper Rare",
