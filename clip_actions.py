@@ -431,6 +431,34 @@ def get_chroma_collection(db_path: Path, collection_name: str, reset: bool):
 # Score fusion
 # ---------------------------------------------------------------------------
 
+def _scores_from_chroma_query(results: dict) -> dict[str, float]:
+    """Map Chroma cosine-distance query hits to similarity scores (1 - dist)."""
+    ids = results.get("ids") or [[]]
+    dists = results.get("distances") or [[]]
+    if not ids[0]:
+        return {}
+    return {id_: 1.0 - dist for id_, dist in zip(ids[0], dists[0])}
+
+
+def _backfill_chroma_scores(
+    collection,
+    query_embedding: list[float],
+    scores: dict[str, float],
+    union_ids: set[str],
+) -> None:
+    """Fill missing union IDs via stored embeddings (L2-normalised → dot = cosine sim)."""
+    missing = [card_id for card_id in union_ids if card_id not in scores]
+    if not missing:
+        return
+    q = np.asarray(query_embedding, dtype=np.float32)
+    got = collection.get(ids=missing, include=["embeddings"])
+    for card_id, emb in zip(got["ids"], got["embeddings"]):
+        if emb is None:
+            continue
+        e = np.asarray(emb, dtype=np.float32)
+        scores[card_id] = float(np.dot(q, e))
+
+
 def _fuse_scores(
     clip_results: dict,
     dino_results: dict,
@@ -438,26 +466,35 @@ def _fuse_scores(
     w_clip: float,
     w_dino: float,
     w_color: float,
+    *,
+    clip_col=None,
+    dino_col=None,
+    color_col=None,
+    q_clip: list[float] | None = None,
+    q_dino: list[float] | None = None,
+    q_color: list[float] | None = None,
 ) -> list[tuple[str, float, float, float, float]]:
     """Merge ranked lists from three collections into one fused ranking.
 
     Returns a list of (card_id, fused_score, clip_score, dino_score, color_score)
-    sorted descending by fused_score.  Absent scores default to 0.
+    sorted descending by fused_score.
+
+    When collections and query embeddings are supplied, any ID in the union of
+    the three top-N lists gets a real score for every signal (back-filled from
+    stored embeddings). Otherwise absent scores default to 0.
     """
-    clip_scores: dict[str, float] = {
-        id_: 1.0 - dist
-        for id_, dist in zip(clip_results["ids"][0], clip_results["distances"][0])
-    }
-    dino_scores: dict[str, float] = {
-        id_: 1.0 - dist
-        for id_, dist in zip(dino_results["ids"][0], dino_results["distances"][0])
-    }
-    color_scores: dict[str, float] = {
-        id_: 1.0 - dist
-        for id_, dist in zip(color_results["ids"][0], color_results["distances"][0])
-    }
+    clip_scores = _scores_from_chroma_query(clip_results)
+    dino_scores = _scores_from_chroma_query(dino_results)
+    color_scores = _scores_from_chroma_query(color_results)
 
     all_ids = set(clip_scores) | set(dino_scores) | set(color_scores)
+    if all_ids and clip_col is not None and q_clip is not None:
+        _backfill_chroma_scores(clip_col, q_clip, clip_scores, all_ids)
+    if all_ids and dino_col is not None and q_dino is not None:
+        _backfill_chroma_scores(dino_col, q_dino, dino_scores, all_ids)
+    if all_ids and color_col is not None and q_color is not None:
+        _backfill_chroma_scores(color_col, q_color, color_scores, all_ids)
+
     fused: list[tuple[str, float, float, float, float]] = []
     for card_id in all_ids:
         cs = clip_scores.get(card_id, 0.0)
@@ -535,8 +572,20 @@ def query_similar(
     color_results = color_col.query(query_embeddings=[q_color], n_results=candidate_n,
                                     include=["distances"])
 
-    fused = _fuse_scores(clip_results, dino_results, color_results,
-                         clip_weight, dino_weight, color_weight)
+    fused = _fuse_scores(
+        clip_results,
+        dino_results,
+        color_results,
+        clip_weight,
+        dino_weight,
+        color_weight,
+        clip_col=clip_col,
+        dino_col=dino_col,
+        color_col=color_col,
+        q_clip=q_clip,
+        q_dino=q_dino,
+        q_color=q_color,
+    )
 
     # Metadata lives in the clip collection (primary)
     meta_lookup: dict[str, dict] = {
