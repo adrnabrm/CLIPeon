@@ -4,6 +4,7 @@ Download card images listed in pokemon-tcg-data JSON into data/raw/<set_id>/<rar
 
 Usage:
   python gather_data.py me1
+  python gather_data.py me1 me2 svp --size large
 
 Resolves the set JSON by trying, in order:
   - $POKEMON_TCG_CARDS_DIR/<set_id>.json if the env var is set
@@ -77,45 +78,21 @@ def download(url: str, dest: Path) -> None:
         dest.write_bytes(resp.read())
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Download Pokémon TCG card images from set JSON.")
-    parser.add_argument("set_id", help="Set id matching the JSON basename, e.g. me1")
-    parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        default=None,
-        help="Output directory (default: <project>/data/raw/<set_id>, with rarity subfolders)",
-    )
-    parser.add_argument(
-        "--size",
-        choices=("small", "large", "both"),
-        default="both",
-        help="Which image URLs to download (default: both)",
-    )
-    args = parser.parse_args()
-
-    set_id = args.set_id.strip().lower()
+def download_set(
+    set_id: str,
+    out_root: Path,
+    sizes: list[tuple[str, str]],
+) -> tuple[int, int]:
+    """Download all cards for one set. Returns (ok_count, fail_count)."""
+    set_id = set_id.strip().lower()
     json_path = resolve_json_path(set_id)
-
-    out_root = args.output
-    if out_root is None:
-        out_root = _script_dir() / "data" / "raw" / set_id
-    else:
-        out_root = out_root.expanduser().resolve()
 
     with json_path.open(encoding="utf-8") as f:
         cards = json.load(f)
 
     if not isinstance(cards, list):
         print(f"Expected a JSON array in {json_path}", file=sys.stderr)
-        return 1
-
-    sizes: list[tuple[str, str]] = []
-    if args.size in ("small", "both"):
-        sizes.append(("small", "small"))
-    if args.size in ("large", "both"):
-        sizes.append(("large", "large"))
+        return 0, 1
 
     ok = 0
     fail = 0
@@ -147,8 +124,76 @@ def main() -> int:
                 print(f"Failed {cid} ({label}): {e}", file=sys.stderr)
                 fail += 1
 
-    print(f"Done. ok={ok} failed={fail} -> {out_root}")
-    return 0 if fail == 0 else 1
+    print(f"Done {set_id}. ok={ok} failed={fail} -> {out_root}")
+    return ok, fail
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Download Pokémon TCG card images from set JSON.")
+    parser.add_argument(
+        "set_ids",
+        nargs="+",
+        metavar="set_id",
+        help="One or more set ids matching JSON basenames, e.g. me1 me2 svp",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output directory for a single set (default: <project>/data/raw/<set_id>)",
+    )
+    parser.add_argument(
+        "--size",
+        choices=("small", "large", "both"),
+        default="both",
+        help="Which image URLs to download (default: both)",
+    )
+    args = parser.parse_args()
+
+    set_ids = [s.strip().lower() for s in args.set_ids]
+    if not set_ids:
+        print("At least one set_id is required", file=sys.stderr)
+        return 1
+
+    if args.output is not None and len(set_ids) > 1:
+        print(
+            "Use -o with a single set_id, or omit -o to write each set under data/raw/<set_id>/",
+            file=sys.stderr,
+        )
+        return 1
+
+    sizes: list[tuple[str, str]] = []
+    if args.size in ("small", "both"):
+        sizes.append(("small", "small"))
+    if args.size in ("large", "both"):
+        sizes.append(("large", "large"))
+
+    total_ok = 0
+    total_fail = 0
+    sets_failed = 0
+
+    for set_id in set_ids:
+        if args.output is None:
+            out_root = _script_dir() / "data" / "raw" / set_id
+        else:
+            out_root = args.output.expanduser().resolve()
+
+        print(f"\n=== {set_id} ===")
+        try:
+            ok, fail = download_set(set_id, out_root, sizes)
+        except FileNotFoundError as e:
+            print(e, file=sys.stderr)
+            sets_failed += 1
+            continue
+
+        total_ok += ok
+        total_fail += fail
+
+    print(f"\nTotal. ok={total_ok} failed={total_fail}")
+    if sets_failed:
+        print(f"Sets skipped (missing JSON): {sets_failed}", file=sys.stderr)
+    return 0 if total_fail == 0 and sets_failed == 0 else 1
 
 
 if __name__ == "__main__":

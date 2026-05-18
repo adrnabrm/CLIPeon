@@ -68,6 +68,10 @@ _index_params: dict = {}
 FULL_ART_RARITIES = frozenset({
     "Illustration Rare",
     "Special Illustration Rare",
+    "Trainer Gallery Rare Holo",
+    "Rare Rainbow",
+    "Rare Secret",
+    "Rare Ultra",
 })
 
 
@@ -361,7 +365,7 @@ def label_new_random(full_art_only: bool = False) -> tuple:
     if path is None:
         if full_art_only:
             gr.Warning(
-                "No unlabeled IR/SIR cards available. Try turning off IR/SIR only."
+                "No unlabeled full art cards available. Try turning off Full Art Only."
             )
         else:
             gr.Warning(
@@ -544,8 +548,8 @@ def build_ui() -> gr.Blocks:
                             label="Top k results",
                         )
                         full_art_checkbox = gr.Checkbox(
+                            label="Full Art Only (IR / SIR / Rare Ultra / TG / GG)",
                             value=False,
-                            label="IR / SIR Only (Illustration Rare / Special Illustration Rare)",
                         )
                         search_btn = gr.Button("Search", variant="primary")
 
@@ -587,7 +591,7 @@ def build_ui() -> gr.Blocks:
                         )
                         label_full_art_checkbox = gr.Checkbox(
                             value=False,
-                            label="IR / SIR Only (Illustration Rare / Special Illustration Rare)",
+                            label="Full Art Only (IR / SIR / Rare Ultra / TG / GG)",
                         )
                         with gr.Row():
                             label_run_btn = gr.Button("Run query", variant="primary")
