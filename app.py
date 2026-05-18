@@ -52,6 +52,15 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent
 LABEL_K = 12
 
+# Search-mode presets: (clip_weight, dino_weight, color_weight)
+# None means "use whatever was saved at index time"
+SEARCH_PRESETS: dict[str, tuple[float, float, float] | None] = {
+    "Balanced (default)": None,
+    "Subject Match": (0.6, 0.3, 0.1),
+    "Style / Vibe": (0.2, 0.6, 0.2),
+    "Color Match": (0.1, 0.2, 0.7),
+}
+
 _clip_model = None
 _clip_preprocess = None
 _dino_model = None
@@ -192,6 +201,9 @@ def _search_hits(
     k: int,
     *,
     full_art_only: bool = False,
+    clip_weight: float | None = None,
+    dino_weight: float | None = None,
+    color_weight: float | None = None,
 ) -> list[SimilarCard]:
     dino_model_name = _index_params.get("dino_model", DEFAULT_DINO_MODEL)
     _ensure_loaded(DEFAULT_MODEL, DEFAULT_PRETRAINED, dino_model_name, _db_path)
@@ -206,6 +218,10 @@ def _search_hits(
         params["s_weight"],
         params["v_weight"],
     )
+
+    w_clip = clip_weight if clip_weight is not None else params["clip_weight"]
+    w_dino = dino_weight if dino_weight is not None else params["dino_weight"]
+    w_color = color_weight if color_weight is not None else params["color_weight"]
 
     base_k = int(k)
     min_pool = 400 if full_art_only else 150
@@ -231,9 +247,9 @@ def _search_hits(
         clip_results,
         dino_results,
         color_results,
-        params["clip_weight"],
-        params["dino_weight"],
-        params["color_weight"],
+        w_clip,
+        w_dino,
+        w_color,
         clip_col=_clip_collection,
         dino_col=_dino_collection,
         color_col=_color_collection,
@@ -252,7 +268,7 @@ def _search_hits(
         for id_, meta in zip(extra["ids"], extra["metadatas"]):
             meta_lookup[id_] = meta
 
-    max_fused = params["clip_weight"] + params["dino_weight"] + params["color_weight"]
+    max_fused = w_clip + w_dino + w_color
     self_match_threshold = max_fused * 0.98
 
     hits: list[SimilarCard] = []
@@ -317,9 +333,13 @@ def search(
     query_image: Image.Image | None,
     k: int,
     full_art_only: bool = False,
+    preset: str = "Balanced (default)",
 ) -> list[tuple[Image.Image, str]]:
     if query_image is None:
         return []
+
+    weights = SEARCH_PRESETS.get(preset)
+    clip_w, dino_w, color_w = weights if weights is not None else (None, None, None)
 
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -330,7 +350,14 @@ def search(
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    hits = _search_hits(loaded, int(k), full_art_only=full_art_only)
+    hits = _search_hits(
+        loaded,
+        int(k),
+        full_art_only=full_art_only,
+        clip_weight=clip_w,
+        dino_weight=dino_w,
+        color_weight=color_w,
+    )
     return _hits_to_gallery(hits)
 
 
@@ -551,6 +578,16 @@ def build_ui() -> gr.Blocks:
                             label="Full Art Only (IR / SIR / Rare Ultra / TG / GG)",
                             value=False,
                         )
+                        preset_radio = gr.Radio(
+                            choices=list(SEARCH_PRESETS.keys()),
+                            value="Balanced (default)",
+                            label="Search mode",
+                            info=(
+                                "Subject Match → same Pokémon/scene  ·  "
+                                "Style/Vibe → texture & composition  ·  "
+                                "Color Match → similar palette"
+                            ),
+                        )
                         search_btn = gr.Button("Search", variant="primary")
 
                 results_gallery = gr.Gallery(
@@ -563,7 +600,7 @@ def build_ui() -> gr.Blocks:
 
                 search_btn.click(
                     fn=search,
-                    inputs=[image_input, k_slider, full_art_checkbox],
+                    inputs=[image_input, k_slider, full_art_checkbox, preset_radio],
                     outputs=results_gallery,
                 )
 

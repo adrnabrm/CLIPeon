@@ -645,6 +645,16 @@ def _chroma_upsert_batched(
 # CLI: index
 # ---------------------------------------------------------------------------
 
+def _get_existing_ids(db_path: Path, collection_name: str) -> set[str]:
+    """Return the set of card IDs already stored in a collection, or empty set if none."""
+    try:
+        col = open_chroma_collection(db_path, collection_name)
+        result = col.get(include=[])
+        return set(result["ids"])
+    except Exception:
+        return set()
+
+
 def cmd_index(args: argparse.Namespace) -> int:
     clean_root = args.clean_dir.expanduser().resolve()
     db_path = args.db_path.expanduser().resolve()
@@ -653,8 +663,8 @@ def cmd_index(args: argparse.Namespace) -> int:
         print(f"Clean directory not found: {clean_root}", file=sys.stderr)
         return 1
 
-    cards = discover_cards(clean_root)
-    if not cards:
+    all_cards = discover_cards(clean_root)
+    if not all_cards:
         print(f"No PNG files under {clean_root}", file=sys.stderr)
         return 1
 
@@ -666,6 +676,28 @@ def cmd_index(args: argparse.Namespace) -> int:
     s_weight = args.s_weight if args.s_weight is not None else DEFAULT_S_WEIGHT
     v_weight = args.v_weight if args.v_weight is not None else DEFAULT_V_WEIGHT
     dino_model_name = args.dino_model if args.dino_model is not None else DEFAULT_DINO_MODEL
+
+    # Filter by set if --sets was provided
+    if args.sets:
+        wanted = set(args.sets)
+        all_cards = [c for c in all_cards if c.set_id in wanted]
+        if not all_cards:
+            print(f"No cards found for set(s): {', '.join(wanted)}", file=sys.stderr)
+            return 1
+        print(f"Limiting to set(s): {', '.join(sorted(wanted))}  ({len(all_cards)} card(s))")
+
+    # Skip cards already in the DB unless --force is set
+    if args.force:
+        cards = all_cards
+    else:
+        existing_ids = _get_existing_ids(db_path, CLIP_COLLECTION)
+        cards = [c for c in all_cards if c.card_id not in existing_ids]
+        skipped = len(all_cards) - len(cards)
+        if skipped:
+            print(f"Skipping {skipped} already-indexed card(s). Use --force to re-index all.")
+        if not cards:
+            print("Nothing new to index.")
+            return 0
 
     device = resolve_device(args.device)
     print(f"Device: {device}")
@@ -703,8 +735,9 @@ def cmd_index(args: argparse.Namespace) -> int:
         color_bins, h_weight, s_weight, v_weight, dino_model_name,
     )
 
+    total_indexed = clip_col.count()
     print(
-        f"Indexed {len(cards)} cards -> {db_path}\n"
+        f"Indexed {len(cards)} new card(s) -> {db_path}  (total in DB: {total_indexed})\n"
         f"  clip_weight={clip_weight}, dino_weight={dino_weight}, color_weight={color_weight}\n"
         f"  color_bins={color_bins}, h={h_weight}, s={s_weight}, v={v_weight}\n"
         f"  dino_model={dino_model_name}"
@@ -794,6 +827,8 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--clean-dir", type=Path, default=None,
                        help="Root of cleaned images (default: <project>/data/clean)")
     _add_shared_args(index)
+    index.add_argument("--sets", nargs="+", metavar="SET_ID",
+                       help="Only index cards from these set(s), e.g. --sets swsh11 swsh12")
     index.add_argument("--batch-size", type=int, default=EMBED_BATCH_SIZE,
                        help=f"Embedding batch size (default: {EMBED_BATCH_SIZE})")
     index.add_argument("--force", action="store_true",
