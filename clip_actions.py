@@ -563,7 +563,7 @@ def query_similar(
         raise RuntimeError("Collections are empty; run: python clip_actions.py index")
 
     # Fixed minimum pool keeps fusion rankings stable across different k values.
-    candidate_n = min(max(k * 3, 150), total)
+    candidate_n = min(max(k * 3, 500), total)
 
     clip_results = clip_col.query(query_embeddings=[q_clip], n_results=candidate_n,
                                   include=["metadatas", "distances"])
