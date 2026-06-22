@@ -224,22 +224,30 @@ def _search_hits(
     w_color = color_weight if color_weight is not None else params["color_weight"]
 
     base_k = int(k)
-    min_pool = 400 if full_art_only else 150
+    min_pool = 500
     candidate_n = min(max(base_k * 3, min_pool), _clip_collection.count())
+    secondary_n = min(max(base_k * 2, 50), candidate_n)
+
+    # Give the dominant signal the full candidate pool; others get a smaller
+    # slice so that re-weighting actually changes which cards appear.
+    max_w = max(w_clip, w_dino, w_color)
+    clip_n = candidate_n if w_clip == max_w else secondary_n
+    dino_n = candidate_n if w_dino == max_w else secondary_n
+    color_n = candidate_n if w_color == max_w else secondary_n
 
     clip_results = _clip_collection.query(
         query_embeddings=[q_clip],
-        n_results=candidate_n,
+        n_results=clip_n,
         include=["metadatas", "distances"],
     )
     dino_results = _dino_collection.query(
         query_embeddings=[q_dino],
-        n_results=candidate_n,
+        n_results=dino_n,
         include=["distances"],
     )
     color_results = _color_collection.query(
         query_embeddings=[q_color],
-        n_results=candidate_n,
+        n_results=color_n,
         include=["distances"],
     )
 
@@ -569,7 +577,7 @@ def build_ui() -> gr.Blocks:
                         )
                         k_slider = gr.Slider(
                             minimum=1,
-                            maximum=12,
+                            maximum=50,
                             step=1,
                             value=5,
                             label="Top k results",

@@ -130,15 +130,21 @@ Each card is embedded three times — once per signal — and stored in three se
 
 **HSV color histogram** (96-d) understands *what palette* is in the image. It splits pixels into 32 buckets per HSV channel (hue, saturation, value), giving 96 numbers that describe the color distribution. Hue is weighted heaviest by default because it identifies the actual color identity of a card (blue ocean, red fire, green forest).
 
-#### How search works (late fusion)
+#### How search works (late fusion with score normalisation)
 
-At query time, the query image is embedded by all three models. Each collection independently returns its top-N most similar cards. The three ranked lists are then **union-merged** and each card receives a weighted final score:
+At query time, the query image is embedded by all three models. Each collection returns a candidate pool of at least **500** cards (or `k × 3`, whichever is larger). In the UI, the collection whose signal has the highest weight gets the full pool; the other two get a smaller slice (`max(k × 2, 50)`). The three lists are **union-merged** — a card only needs to appear in one signal's pool to be considered.
+
+Because the three embedding spaces produce cosine similarities with different distributions (color scores tend to cluster higher than CLIP or DINOv2 scores), each signal's scores are **min-max normalised within the pool** before weighting:
 
 ```
-final_score = clip_weight × clip_score + dino_weight × dino_score + color_weight × color_score
+normalised_x = (x - min(x)) / (max(x) - min(x))   # per signal, across the pool
+
+final_score = clip_weight × norm_clip + dino_weight × norm_dino + color_weight × norm_color
 ```
 
-A card only needs to rank highly in **one or more** signals to be competitive. A card missed by CLIP but found by DINOv2 (similar style, different subject) can still surface in the top results. This is the key advantage over baking everything into a single hybrid vector: each axis remains independently tunable.
+This ensures the weights mean what they say: a `color_weight` of 0.20 actually contributes 20% of the final score rather than being inflated by an artificially high raw distribution. The per-signal scores shown in results (C / D / Col) are the raw cosine similarities; only the fused ranking uses normalised values.
+
+Cards that score consistently across all three signals rank higher than cards that dominate one signal but are weak on the others.
 
 #### Tuning the embedding
 

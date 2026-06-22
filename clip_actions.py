@@ -459,6 +459,17 @@ def _backfill_chroma_scores(
         scores[card_id] = float(np.dot(q, e))
 
 
+def _minmax_normalize(scores: dict[str, float]) -> dict[str, float]:
+    if not scores:
+        return scores
+    lo = min(scores.values())
+    hi = max(scores.values())
+    span = hi - lo
+    if span < 1e-9:
+        return {k: 1.0 for k in scores}
+    return {k: (v - lo) / span for k, v in scores.items()}
+
+
 def _fuse_scores(
     clip_results: dict,
     dino_results: dict,
@@ -477,7 +488,9 @@ def _fuse_scores(
     """Merge ranked lists from three collections into one fused ranking.
 
     Returns a list of (card_id, fused_score, clip_score, dino_score, color_score)
-    sorted descending by fused_score.
+    sorted descending by fused_score. Per-signal scores in the tuple are raw
+    cosine similarities; the fused score uses min-max normalised values so the
+    three signals are on a comparable scale before weighting.
 
     When collections and query embeddings are supplied, any ID in the union of
     the three top-N lists gets a real score for every signal (back-filled from
@@ -495,12 +508,19 @@ def _fuse_scores(
     if all_ids and color_col is not None and q_color is not None:
         _backfill_chroma_scores(color_col, q_color, color_scores, all_ids)
 
+    norm_clip = _minmax_normalize(clip_scores)
+    norm_dino = _minmax_normalize(dino_scores)
+    norm_color = _minmax_normalize(color_scores)
+
     fused: list[tuple[str, float, float, float, float]] = []
     for card_id in all_ids:
         cs = clip_scores.get(card_id, 0.0)
         ds = dino_scores.get(card_id, 0.0)
         co = color_scores.get(card_id, 0.0)
-        fused.append((card_id, w_clip * cs + w_dino * ds + w_color * co, cs, ds, co))
+        ncs = norm_clip.get(card_id, 0.0)
+        nds = norm_dino.get(card_id, 0.0)
+        nco = norm_color.get(card_id, 0.0)
+        fused.append((card_id, w_clip * ncs + w_dino * nds + w_color * nco, cs, ds, co))
 
     fused.sort(key=lambda x: x[1], reverse=True)
     return fused
